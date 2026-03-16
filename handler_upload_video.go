@@ -1,12 +1,14 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -70,17 +72,48 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
-	io.Copy(tempFile, file)
-	tempFile.Seek(0, io.SeekStart)
+	if _, err := io.Copy(tempFile, file); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not write file to disk", err)
+		return
+	}
 
-	key := getAssetPath(mediaType)
+	aspectType, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not get aspect ratio of videoa", err)
+		return
+	}
+	folder := ""
+	switch aspectType {
+	case "16:9":
+		folder = "landscape/"
+	case "9:16":
+		folder = "portrait/"
+	default:
+		folder = "other/"
+	}
 
-	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+	key := folder + getAssetPath(mediaType)
+	processedFile, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not get processed fast start", err)
+		return
+	}
+	defer os.Remove(processedFile)
+
+	openedFile, err := os.Open(processedFile)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not open processed file", err)
+		return
+	}
+	defer openedFile.Close()
+
+	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        tempFile,
+		Body:        openedFile,
 		ContentType: aws.String(mediaType),
 	})
+
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video to aws", err)
 		return
@@ -95,4 +128,49 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, 200, video)
+}
+
+func getVideoAspectRatio(filepath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filepath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("Running ffprobe led to error: %v", err)
+	}
+	type aspectRatio struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+	var videoAspects aspectRatio
+	err = json.Unmarshal(out.Bytes(), &videoAspects)
+	if err != nil {
+		return "", fmt.Errorf("Unable to unmarshal json from ffprobe: %v", err)
+	}
+
+	if len(videoAspects.Streams) == 0 {
+		return "", fmt.Errorf("No streams found in video probe")
+	}
+
+	width := videoAspects.Streams[0].Width
+	height := videoAspects.Streams[0].Height
+	if width == 16*height/9 {
+		return "16:9", nil
+	} else if height == 16*width/9 {
+		return "9:16", nil
+	}
+	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outFilePath := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outFilePath)
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("Running ffmpeg led to error: %v", err)
+	}
+	return outFilePath, nil
+
 }
